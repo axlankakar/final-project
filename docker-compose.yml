@@ -12,6 +12,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__WEBSERVER__WORKERS: "4"
     _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-apache-spark apache-airflow-providers-apache kafka-python
+    AIRFLOW__CORE__LOGGING_LEVEL: DEBUG
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
@@ -115,6 +116,8 @@ services:
     container_name: stock_airflow_init
     entrypoint: >
       /bin/bash -c '
+      mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
+      chmod -R 777 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
       airflow db init &&
       airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
       airflow connections delete spark_default || true &&
@@ -126,20 +129,29 @@ services:
       '
 
   airflow-webserver:
-    <<: *airflow-common
-    command: airflow webserver
-    ports:
-      - "8081:8080"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
+  <<: *airflow-common
+  command: >
+    bash -c "
+    while ! airflow db check; do
+      echo 'Waiting for database to be ready...';
+      sleep 5;
+    done &&
+    airflow webserver
+    "
+  ports:
+    - "8081:8080"
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 30s
+    retries: 10
+    start_period: 60s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
 
   airflow-scheduler:
     <<: *airflow-common
