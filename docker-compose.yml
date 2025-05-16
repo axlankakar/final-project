@@ -110,7 +110,7 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    container_name: airflow_init
+    container_name: stock_airflow_init
     entrypoint: >
       /bin/bash -c '
       airflow db init &&
