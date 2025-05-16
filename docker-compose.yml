@@ -8,20 +8,28 @@ x-airflow-common: &airflow-common
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    AIRFLOW__WEBSERVER__SECRET_KEY: "your-secret-key-here"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "${AIRFLOW_SECRET_KEY:-your-secret-key-here}"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__WEBSERVER__WORKERS: "4"
-    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-apache-spark apache-airflow-providers-apache kafka-python
-    AIRFLOW__CORE__LOGGING_LEVEL: DEBUG
+    AIRFLOW__CORE__PARALLELISM: 4
+    AIRFLOW__CORE__DAG_FILE_PROCESSOR_TIMEOUT: 600
+    AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: "false"
+    _PIP_ADDITIONAL_REQUIREMENTS: >
+      apache-airflow-providers-apache-spark==4.1.4
+      apache-airflow-providers-apache-kafka==1.1.1
+      kafka-python==2.0.2
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
     - ./data_generator:/opt/airflow/data_generator
     - ./spark:/opt/airflow/spark
-  depends_on: &airflow-common-depends-on
-    postgres:
-      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
 
 services:
   zookeeper:
@@ -30,18 +38,21 @@ services:
       - "2181:2181"
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-    
+    restart: unless-stopped
+
   kafka:
     image: wurstmeister/kafka:latest
     ports:
       - "9092:9092"
       - "9093:9093"
     environment:
+      KAFKA_BROKER_ID: 1
       KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka:9092,OUTSIDE://${AZURE_VM_IP}:9093
       KAFKA_LISTENERS: INSIDE://0.0.0.0:9092,OUTSIDE://0.0.0.0:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
@@ -49,14 +60,18 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_CREATE_TOPICS: "stock_data:1:1"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms256M"
     depends_on:
       zookeeper:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics.sh --list --bootstrap-server localhost:9092"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   spark-master:
     image: bitnami/spark:latest
@@ -69,14 +84,17 @@ services:
       - SPARK_RPC_ENCRYPTION_ENABLED=no
       - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
       - SPARK_SSL_ENABLED=no
+      - SPARK_MASTER_OPTS="-Dspark.deploy.recoveryMode=FILESYSTEM -Dspark.deploy.recoveryDirectory=/opt/spark/recovery"
     volumes:
       - ./spark:/opt/spark/work-dir
+      - spark_recovery:/opt/spark/recovery
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 3
-      
+    restart: unless-stopped
+
   spark-worker:
     image: bitnami/spark:latest
     environment:
@@ -93,6 +111,7 @@ services:
     depends_on:
       spark-master:
         condition: service_healthy
+    restart: unless-stopped
 
   postgres:
     image: postgres:13
@@ -108,58 +127,62 @@ services:
       - ./sql:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 5s
+      interval: 10s
+      timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   airflow-init:
     <<: *airflow-common
     container_name: stock_airflow_init
     entrypoint: >
       /bin/bash -c '
-      mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
-      chmod -R 777 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
       airflow db init &&
       airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
       airflow connections delete spark_default || true &&
       airflow connections add spark_default \
-        --conn-type generic \
+        --conn-type spark \
         --conn-host spark://spark-master \
         --conn-port 7077 \
         --conn-extra "{\"spark-home\":\"/opt/bitnami/spark\", \"spark-binary\":\"spark-submit\", \"deploy-mode\":\"client\"}"
       '
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   airflow-webserver:
-  <<: *airflow-common
-  command: >
-    bash -c "
-    while ! airflow db check; do
-      echo 'Waiting for database to be ready...';
-      sleep 5;
-    done &&
-    airflow webserver
-    "
-  ports:
-    - "8081:8080"
-  healthcheck:
-    test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-    interval: 30s
-    timeout: 30s
-    retries: 10
-    start_period: 60s
-  depends_on:
-    postgres:
-      condition: service_healthy
-    airflow-init:
-      condition: service_completed_successfully
-  restart: unless-stopped
+    <<: *airflow-common
+    command: airflow webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   airflow-scheduler:
     <<: *airflow-common
     command: airflow scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     depends_on:
-      <<: *airflow-common-depends-on
+      postgres:
+        condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+    restart: unless-stopped
 
   data-generator:
     build:
@@ -197,10 +220,11 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8050/"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
 
 volumes:
-  postgres_data: 
+  postgres_data:
+  spark_recovery: 
