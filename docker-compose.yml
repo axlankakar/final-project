@@ -13,7 +13,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__WORKERS: "4"
     _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-apache-spark apache-airflow-providers-apache kafka-python
   volumes:
-    - ./airflow:/opt/airflow
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
     - ./data_generator:/opt/airflow/data_generator
     - ./spark:/opt/airflow/spark
   depends_on: &airflow-common-depends-on
